@@ -22,6 +22,10 @@
  */
 #include "sched.h"
 
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif /* CONFIG_SCHED_BORE */
+
 #include <trace/hooks/sched.h>
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
@@ -41,7 +45,9 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
  */
 unsigned int sysctl_sched_latency			= 6000000ULL;
 EXPORT_SYMBOL_GPL(sysctl_sched_latency);
+#ifndef CONFIG_SCHED_BORE
 static unsigned int normalized_sysctl_sched_latency	= 6000000ULL;
+#endif
 
 /*
  * The initial- and re-scaling of tunables is configurable
@@ -54,7 +60,11 @@ static unsigned int normalized_sysctl_sched_latency	= 6000000ULL;
  *
  * (default SCHED_TUNABLESCALING_LOG = *(1+ilog(ncpus))
  */
+#ifdef CONFIG_SCHED_BORE
+unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_NONE;
+#else /* !CONFIG_SCHED_BORE */
 unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
+#endif /* CONFIG_SCHED_BORE */
 
 /*
  * Minimal preemption granularity for CPU-bound tasks:
@@ -62,7 +72,9 @@ unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
  * (default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
 unsigned int sysctl_sched_min_granularity			= 750000ULL;
+#ifndef CONFIG_SCHED_BORE
 static unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
+#endif
 
 /*
  * This value is kept at sysctl_sched_latency/sysctl_sched_min_granularity
@@ -85,7 +97,15 @@ unsigned int sysctl_sched_child_runs_first __read_mostly;
  * (default: 1 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
 unsigned int sysctl_sched_wakeup_granularity			= 1000000UL;
-static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
+#ifndef CONFIG_SCHED_BORE
+static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000ULL;
+#endif
+
+#ifdef CONFIG_SCHED_BORE
+static const unsigned int nsecs_per_tick       = 1000000000ULL / HZ;
+unsigned int sysctl_sched_min_base_slice       = CONFIG_MIN_BASE_SLICE_NS;
+__read_mostly uint sysctl_sched_base_slice     = 1000000000ULL / HZ;
+#endif /* CONFIG_SCHED_BORE */
 
 const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
 
@@ -168,6 +188,7 @@ static inline void update_load_set(struct load_weight *lw, unsigned long w)
  *
  * This idea comes from the SD scheduler of Con Kolivas:
  */
+#ifndef CONFIG_SCHED_BORE
 static unsigned int get_update_sysctl_factor(void)
 {
 	unsigned int cpus = min_t(unsigned int, num_online_cpus(), 8);
@@ -188,9 +209,21 @@ static unsigned int get_update_sysctl_factor(void)
 
 	return factor;
 }
+#endif /* !CONFIG_SCHED_BORE */
 
 static void update_sysctl(void)
 {
+#ifdef CONFIG_SCHED_BORE
+	unsigned int base_slice = nsecs_per_tick *
+		max(1UL, DIV_ROUND_UP(sysctl_sched_min_base_slice, nsecs_per_tick));
+
+	sysctl_sched_base_slice = base_slice;
+	sysctl_sched_min_granularity = base_slice;
+	sysctl_sched_wakeup_granularity = base_slice;
+	sysctl_sched_latency = 6 * base_slice;
+	sched_nr_latency = DIV_ROUND_UP(sysctl_sched_latency,
+					sysctl_sched_min_granularity);
+#else /* !CONFIG_SCHED_BORE */
 	unsigned int factor = get_update_sysctl_factor();
 
 #define SET_SYSCTL(name) \
@@ -199,7 +232,15 @@ static void update_sysctl(void)
 	SET_SYSCTL(sched_latency);
 	SET_SYSCTL(sched_wakeup_granularity);
 #undef SET_SYSCTL
+#endif /* CONFIG_SCHED_BORE */
 }
+
+#ifdef CONFIG_SCHED_BORE
+void sched_update_min_base_slice(void)
+{
+	update_sysctl();
+}
+#endif /* CONFIG_SCHED_BORE */
 
 void __init sched_init_granularity(void)
 {
@@ -627,6 +668,7 @@ struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
  * Scheduling class statistics methods:
  */
 
+#if !defined(CONFIG_SCHED_BORE)
 int sched_update_scaling(void)
 {
 	unsigned int factor = get_update_sysctl_factor();
@@ -643,6 +685,7 @@ int sched_update_scaling(void)
 
 	return 0;
 }
+#endif /* !CONFIG_SCHED_BORE */
 #endif
 
 /*
@@ -666,6 +709,10 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
  */
 static u64 __sched_period(unsigned long nr_running)
 {
+#ifdef CONFIG_SCHED_BORE
+	if (static_branch_likely(&sched_bore_key))
+		return nr_running * sysctl_sched_min_granularity;
+#endif /* CONFIG_SCHED_BORE */
 	if (unlikely(nr_running > sched_nr_latency))
 		return nr_running * sysctl_sched_min_granularity;
 	else
@@ -831,6 +878,31 @@ static void update_tg_load_avg(struct cfs_rq *cfs_rq)
 /*
  * Update the current task's runtime statistics.
  */
+#ifdef CONFIG_SCHED_BORE
+static inline bool do_preempt_weight(struct cfs_rq *cfs_rq,
+				     struct sched_entity *pse, struct sched_entity *se)
+{
+	bool futex_waiting;
+
+	if (!static_branch_likely(&sched_bore_key))
+		return false;
+
+	futex_waiting = entity_is_task(pse) && task_of(pse)->bore.futex_waiting;
+
+	if (!futex_waiting) {
+		if (!static_branch_likely(&sched_burst_protect_slice_cond_key))
+			return false;
+
+		if (static_branch_unlikely(&sched_burst_protect_slice_prefer_key)
+				? (pse->load.weight <= se->load.weight)
+				: (pse->load.weight <  se->load.weight))
+			return false;
+	}
+
+	return entity_before(pse, se);
+}
+#endif /* CONFIG_SCHED_BORE */
+
 static void update_curr(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
@@ -858,6 +930,9 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	if (entity_is_task(curr)) {
 		struct task_struct *curtask = task_of(curr);
 
+#ifdef CONFIG_SCHED_BORE
+		update_curr_bore(curtask, delta_exec);
+#endif /* CONFIG_SCHED_BORE */
 		trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
 		cgroup_account_cputime(curtask, delta_exec);
 		account_group_exec_runtime(curtask, delta_exec);
@@ -3079,7 +3154,7 @@ static inline void
 dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) { }
 #endif
 
-static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
 {
 	if (se->on_rq) {
@@ -4397,6 +4472,21 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 		se->vruntime = vruntime;
 	else
 		se->vruntime = max_vruntime(se->vruntime, vruntime);
+#ifdef CONFIG_SCHED_BORE
+	if (!initial &&
+	    static_branch_likely(&sched_bore_key) &&
+	    static_branch_unlikely(&sched_credit_key) &&
+	    entity_is_task(se)) {
+		u64 credit = bore_credit_ns(task_of(se));
+
+		if (credit) {
+			if (se->vruntime > credit)
+				se->vruntime -= credit;
+			else
+				se->vruntime = 0;
+		}
+	}
+#endif /* CONFIG_SCHED_BORE */
 	trace_android_rvh_place_entity(cfs_rq, se, initial, &vruntime);
 }
 
@@ -5937,6 +6027,17 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	bool was_sched_idle = sched_idle_rq(rq);
 
 	util_est_dequeue(&rq->cfs, p);
+
+#ifdef CONFIG_SCHED_BORE
+	if (flags & DEQUEUE_SLEEP) {
+		struct cfs_rq *bore_cfs_rq = cfs_rq_of(&p->se);
+
+		if (bore_cfs_rq->curr == &p->se)
+			update_curr(bore_cfs_rq);
+		bore_note_sleep(p, rq_clock(rq));
+		restart_burst_bore(p);
+	}
+#endif /* CONFIG_SCHED_BORE */
 
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
@@ -7517,6 +7618,11 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	if (ignore)
 		return;
 
+#ifdef CONFIG_SCHED_BORE
+	if (do_preempt_weight(cfs_rq_of(se), pse, se))
+		goto preempt;
+#endif /* CONFIG_SCHED_BORE */
+
 	if (wakeup_preempt_entity(se, pse) == 1) {
 		/*
 		 * Bias pick_next to pick the sched entity that is
@@ -7765,6 +7871,27 @@ static void yield_task_fair(struct rq *rq)
 	/*
 	 * Are we the only task in the tree?
 	 */
+#ifdef CONFIG_SCHED_BORE
+	update_rq_clock(rq);
+	/*
+	 * Update run-time statistics of the 'current'.
+	 */
+	if (curr->policy != SCHED_BATCH)
+		update_curr(cfs_rq);
+	restart_burst_bore(curr);
+	if (unlikely(rq->nr_running == 1))
+		return;
+
+	clear_buddies(cfs_rq, se);
+	if (curr->policy != SCHED_BATCH) {
+		/*
+		 * Tell update_rq_clock() that we've just updated,
+		 * so we don't do microscopic update in schedule()
+		 * and double the fastpath cost.
+		 */
+		rq_clock_skip_update(rq);
+	}
+#else /* !CONFIG_SCHED_BORE */
 	if (unlikely(rq->nr_running == 1))
 		return;
 
@@ -7783,6 +7910,7 @@ static void yield_task_fair(struct rq *rq)
 		 */
 		rq_clock_skip_update(rq);
 	}
+#endif /* CONFIG_SCHED_BORE */
 
 	set_skip_buddy(se);
 }
@@ -11663,6 +11791,10 @@ static void switched_from_fair(struct rq *rq, struct task_struct *p)
 static void switched_to_fair(struct rq *rq, struct task_struct *p)
 {
 	attach_task_cfs_rq(p);
+
+#ifdef CONFIG_SCHED_BORE
+	reset_task_bore(p);
+#endif /* CONFIG_SCHED_BORE */
 
 	if (task_on_rq_queued(p)) {
 		/*

@@ -39,6 +39,9 @@
 #include <linux/memblock.h>
 #include <linux/fault-inject.h>
 #include <linux/time_namespace.h>
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif /* CONFIG_SCHED_BORE */
 
 #include <asm/futex.h>
 
@@ -2872,7 +2875,13 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 		 */
 		if (!timeout || timeout->task) {
 			trace_android_vh_futex_sleep_start(current);
+#ifdef CONFIG_SCHED_BORE
+			current->bore.futex_waiting = true;
+#endif /* CONFIG_SCHED_BORE */
 			freezable_schedule();
+#ifdef CONFIG_SCHED_BORE
+			current->bore.futex_waiting = false;
+#endif /* CONFIG_SCHED_BORE */
 		}
 	}
 	__set_current_state(TASK_RUNNING);
